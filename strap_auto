@@ -1,0 +1,50 @@
+#! /bin/sh
+
+clean()
+{
+    if [ -r Makefile ]; then
+	make clean
+    fi
+    rm -f Makefile.in Makefile configure
+    rm -f scripts/Makefile.in scripts/Makefile 
+}
+
+wipeout()
+{
+	clean
+	rm -rf aclocal.m4 config.guess config.sub install-sh missing \
+	       mkinstalldirs config.log config.status configure \
+	       libtool ltmain.sh config.h stamp-h stamp-h.in \
+	       config.h.in
+	rm -f *~ src/*~ etc/*~ scripts/*~ 
+	rm -rf autom4te.cache src/.deps
+}
+
+all()
+{
+	clean
+	echo "Clean done"
+	aclocal
+	echo "aclocal done"
+	automake --add-missing
+	echo "automake done"
+	autoconf
+	echo "autoconf done"
+}
+
+case "$1" in
+	clean)
+		clean
+		;;
+	wipeout)
+		wipeout
+		;;
+	all)
+		all
+		;;
+	*)
+		echo "Usage: .strap-auto {all|clean|wipeout}"
+		exit 1
+		;;
+esac
+exit 0

@@ -1,0 +1,370 @@
+#!/bin/bash
+
+# Globals
+VERSION=@VERSION@
+SY_SUCCESS_EXIT=0
+SY_FAIL_EXIT=1
+
+usage() 
+{
+    echo 
+    echo "Usage: pSync [OPTIONS] <update|commit>"
+    echo " Where"
+    echo	
+    echo " commit   : commit local changes to repository"
+    echo " update   : update from repository"
+    echo	
+    echo " and OPTIONS are:"
+    echo	
+    echo "  --config <configuration file>"
+    echo "      Path to the configuration file. Default: $HOME/.pSync.conf"
+    echo "  --show"
+    echo "      Show only what would happen with no changes made"
+    echo "  --version"
+    echo "      Print pSync's version" 
+    echo "  --help"
+    echo "      This help screen" 
+    echo
+    echo " Logfile syntax:"
+    echo "YXcstpoguax  path/to/file"
+    echo "|||||||||||"
+    echo "\`----------- the type of update being done::"
+    echo " ||||||||||   <: file is being transferred to the remote host (sent)."
+    echo " ||||||||||   >: file is being transferred to the local host (received)."
+    echo " ||||||||||   c: local change/creation for the item, such as:"
+    echo " ||||||||||      - the creation of a directory"
+    echo " ||||||||||      - the changing of a symlink,"
+    echo " ||||||||||      - etc."
+    echo " ||||||||||   h: the item is a hard link to another item (requires --hard-links)."
+    echo " ||||||||||   .: the item is not being updated (though it might have attributes that are being modified)."
+    echo " ||||||||||   *: means that the rest of the itemized-output area contains a message (e.g. "deleting")."
+    echo " ||||||||||"
+    echo " \`---------- the file type:"
+    echo "  |||||||||   f for a file,"
+    echo "  |||||||||   d for a directory,"
+    echo "  |||||||||   L for a symlink,"
+    echo "  |||||||||   D for a device,"
+    echo "  |||||||||   S for a special file (e.g. named sockets and fifos)."
+    echo "  |||||||||"
+    echo " \`--------- c: different checksum (for regular files)"
+    echo "   ||||||||     changed value (for symlink, device, and special file)"
+    echo "   \`-------- s: Size is different"
+    echo "    \`------- t: Modification time is different"
+    echo "     \`------ p: Permission are different"
+    echo "      \`----- o: Owner is different"
+    echo "       \`---- g: Group is different"
+    echo "        \`--- u: The u slot is reserved for future use."
+    echo "         \`-- a: The ACL information changed"
+    
+    exit $BK_FAIL_EXIT
+}
+
+config_file()
+{
+    if [ x"$1" = "x" ]; then 
+	SY_CONFIG="$HOME/.pSync.conf"
+    else
+	SY_CONFIG="$1"
+    fi
+}
+
+do_sync()
+{
+    # set rsync preserve options
+    SY_PRESERVE="--links --times --owner --group"
+    # determine configuration file and get the configuration options
+    config_file $1
+    SY_LOGFILE=`@GET_CONFIG@ --file=$SY_CONFIG --option=Logfile`
+    check_logfile
+    SY_REPO=`@GET_CONFIG@ --file=$SY_CONFIG --option=Repository`
+    SY_MASK=`@GET_CONFIG@ --file=$SY_CONFIG --option=LocalMask`
+    # add escape char '\' to the local directory mask
+    SY_MASK=`echo $SY_MASK | @SED@ s/\\\//\\\\\\\\\\\\\\//g`
+    SY_TMP_PATH=`@GET_CONFIG@ --file=$SY_CONFIG --option=TempDir`
+    check_tmp_dir
+    SY_GLOBAL_EXCLUDE=`@GET_CONFIG@ --file=$SY_CONFIG --option=GlobalExclude`
+    SY_FAT=`@GET_CONFIG@ --file=$SY_CONFIG --option=FAT`
+    # Change time resolution if compating with a FAT file system
+    if [ "$SY_FAT" == "Yes" ]; then
+	SY_MODE="$SY_MODE --modify-window=2"
+    fi
+    echo 
+    SY_I=0
+    SY_IFS=$IFS # keep 'old' IFS to restore it afterwards
+    IFS=$'\n' # NL is the only 'line seperator'
+    for LINE in $( @GET_CONFIG@ --file=$SY_CONFIG --option=Sync ); do
+	SY_I=$((SY_I + 1))
+	get_exclude_pattern
+	# Remove last occurence of '/" in line because several test later on depend on it
+	LINE=`echo $SY_CONF_PATH | @SED@ s/\\\\/\\\$//`
+	SY_LOGFILENAME=`echo $SY_CONF_PATH | @SED@ s/\\\\//_/g`
+	SY_LOGFILENAME="$SY_COM$SY_LOGFILENAME.log"
+	set_target_source
+	# the configured sync path needs to be an direct subdirectory or file relative to the configured 'LocalMask'
+	# this limitation exists because n level syncing is not needed. 
+	check_direct_subdir
+	if [ x"$CHK" = "x" ]; then
+	    echo "Configuration warning: The configured sync path needs to be an direct" 
+	    echo "subdirectory or file relative to the configured 'LocalMask'"
+	    echo "this limitation exists because n level syncing is not needed."
+	    echo "$SY_SOURCE NOT SYNCHRONIZED"
+	    if [ x"$SY_SHOW" = "x" ]; then
+		echo "$SY_SOURCE NOT SYNCHRONIZED" >> $SY_LOGFILE
+		echo "Please see psync's configuration warning"  >> $SY_LOGFILE
+	    fi
+	else
+	    IFS=$SY_IFS # Restore 'old' IFS since rsync seems to need default settings
+	    if [ x"$SY_SHOW" = "x" ]; then
+		@RSYNC@ --progress $SY_MODE --log-file=$SY_LOGFILE/$SY_LOGFILENAME $SY_EXCLUDE_PATTERN --recursive $SY_PRESERVE --update $SY_SOURCE $SY_TARGET
+	    else
+		@RSYNC@ $SY_MODE $SY_EXCLUDE_PATTERN --recursive $SY_PRESERVE --update $SY_SOURCE $SY_TARGET
+	    fi
+	    # Swich back to 'NL' as the only line seperator to successful read configuration 
+	    IFS=$'\n' # NL is the only 'line seperator'
+	fi
+	# Delete tmp file if any
+	if [ x"$SY_EXCLUDE_PATTERN" != "x" ]; then
+	    rm $SY_EXCLUDE_PATTERN_FILE
+	fi
+    done
+    IFS=$SY_IFS # Restore 'old' IFS
+}
+
+get_exclude_pattern()
+{
+    # ToDo: check syntax of exclude pattern (use rsync itself to check)
+    # reset exclude pattern
+    SY_EXCLUDE_PATTERN=""
+    # get local excludes from config
+    SY_LOCAL_EXCLUDE=`echo $LINE | @SED@ s/[^\;]*\;//`
+    SY_CONF_PATH=`echo $LINE | @SED@ s/\;[^\;]*//`
+    # create tmp file if needed and add exclude option for rsync if excludes configured
+    if [ "$SY_CONF_PATH" != "$SY_LOCAL_EXCLUDE" ] || [ x"$SY_GLOBAL_EXCLUDE" != "x" ]; then
+	SY_EXCLUDE_PATTERN_FILE=$SY_TMP_PATH/pSync_exclude_pattern.tmp
+	SY_EXCLUDE_PATTERN="--exclude-from=$SY_EXCLUDE_PATTERN_FILE"
+	touch $SY_EXCLUDE_PATTERN_FILE
+    fi
+    # write local excludes
+    if [ "$SY_CONF_PATH" != "$SY_LOCAL_EXCLUDE" ] ; then
+	SYP_IFS=$IFS # store IFW to get restored
+	IFS=$',' # Use a ',' as seperator
+	for LPATTERN in $SY_LOCAL_EXCLUDE; do
+	    echo "$LPATTERN" >> $SY_EXCLUDE_PATTERN_FILE
+	done
+	IFS=$SYP_IFS # switch back to 'old' IFS
+    fi
+    # write global excludes
+    if [ x"$SY_GLOBAL_EXCLUDE" != "x" ]; then
+	SYP_IFS=$IFS # store IFW to get restored
+	IFS=$',' # Use a ',' as seperator
+	for GPATTERN in $SY_GLOBAL_EXCLUDE; do
+	    echo "$GPATTERN" >> $SY_EXCLUDE_PATTERN_FILE
+	done
+	IFS=$SYP_IFS # switch back to 'old' IFS
+    fi
+}
+
+check_tmp_dir()
+{
+    if [ ! -d $SY_TMP_PATH ] ; then
+	echo "Temporary directory doesn't exist ($SY_TMP_PATH) - please check your configuration"
+	exit 1
+    else
+	if [ ! -w $SY_TMP_PATH ] ; then
+	    echo "Temporary directory is not writeable ($SY_TMP_PATH) - please check your configuration"
+	    exit 1
+	fi
+    fi
+}
+
+check_logfile()
+{
+    # Remove last occurence of '/" if any
+    SY_LOGFILE=`echo $SY_LOGFILE | @SED@ s/\\\\/\\\$//`
+    # get configured the logfile directory 
+    LOGDIR=`echo $SY_LOGFILE | @SED@ s/^.*\\\\///`
+    LOGBASE=`echo $SY_LOGFILE | @SED@ s/$LOGDIR//`
+    if [ -d $LOGBASE ] ; then
+	if [ -w $LOGBASE ] ; then
+	    if ! [ -d $SY_LOGFILE ] ; then 
+		mkdir $SY_LOGFILE
+	    fi
+	else
+	    echo "Logfile location is not writeable ($LOGBASE) - please check your configuration"
+	    exit 1
+	fi
+    else
+	echo "Logfile location dosn't exist ($LOGBASE) - please check your configuration"
+	exit 1
+    fi
+}
+
+check_direct_subdir()
+{
+    SY_PATH_EX=`echo $SY_CONF_PATH | @SED@ s/$SY_MASK//`
+    CHK=`echo $SY_PATH_EX | @SED@ s/^.\\\\+\\\\/.\\\\+$//`
+}
+
+set_target_source()
+{   
+    if [ "$SY_COM" = "u" ]; then
+	SY_REPO_PATH=`echo $SY_CONF_PATH | @SED@ s/$SY_MASK//`
+	# add escape char '\' to the repository path
+	SY_E_REPO_PATH=`echo $SY_REPO_PATH | @SED@ s/\\\//\\\\\\\\\\\\\\//g`
+	SY_TARGET=`echo $SY_CONF_PATH | @SED@ s/$SY_E_REPO_PATH//`
+	# Check if update target base directory exists and is writeable
+	check_dir_exists_write $SY_TARGET
+	SY_TARGET=$SY_TARGET
+	SY_SOURCE=$SY_REPO/$SY_REPO_PATH
+	# Check if update source is readable
+	check_exists_read $SY_SOURCE
+	echo "Updating: $SY_SOURCE"
+    fi
+    if [ "$SY_COM" = "c" ]; then
+	SY_TARGET=$SY_REPO
+	SY_SOURCE=$SY_CONF_PATH
+	# Ckeck if repostitory (commit target) exists and is writable 
+	check_dir_exists_write $SY_TARGET
+	# Check if configured path or file exists and is readable
+	check_exists_read $SY_SOURCE
+	echo "Commiting: $SY_SOURCE"
+    fi
+}
+
+check_remote()
+{
+    MATCH=`echo $1 | @SED@ s/.*@.*:.*/matched/`
+    if [ "$MATCH" == "matched" ]; then
+	SY_REPO_LOC="remote"
+    else
+	SY_REPO_LOC="local"
+    fi
+}
+
+check_exists_read()
+{
+    check_remote $1
+    if [ "$SY_REPO_LOC" == "remote" ] ; then
+	SY_REMOTE_LOGIN=`echo $1 | @SED@ s/:.*//`
+	SY_REMOTE_PATH=`echo $1 | @SED@ s/.*://`
+	RES=`ssh $SY_REMOTE_LOGIN "if [ -e $SY_REMOTE_PATH ] ; then echo TRUE ; else echo FALSE ; fi"`
+    else
+	RES=`if [ -e $1 ] ; then echo TRUE ; else echo FALSE ; fi`
+    fi
+    if [ "$RES" == "FALSE" ]; then 
+	echo "$1 doesn't exists"
+	exit 1
+    else
+	if [ "$SY_REPO_LOC" == "remote" ] ; then
+	    RES=`ssh $SY_REMOTE_LOGIN "if [ -r $SY_REMOTE_PATH ] ; then echo TRUE ; else echo FALSE ; fi"`
+	else
+	    RES=`if [ -r $1 ] ; then echo TRUE ; else echo FALSE ; fi`
+	fi
+        if [ "$RES" == "FALSE" ]; then 
+	    echo "$1 is not readable"
+	    exit 1
+	fi
+    fi
+}
+
+check_dir_exists_write()
+{
+    check_remote $1
+    if [ "$SY_REPO_LOC" == "remote" ] ; then
+	SY_REMOTE_LOGIN=`echo $1 | @SED@ s/:.*//`
+	SY_REMOTE_PATH=`echo $1 | @SED@ s/.*://`
+	RES=`ssh $SY_REMOTE_LOGIN "if [ -d $SY_REMOTE_PATH ] ; then echo TRUE ; else echo FALSE ; fi"`
+    else
+	RES=`if [ -d $1 ] ; then echo TRUE ; else echo FALSE ; fi`
+    fi
+    if [ "$RES" == "TRUE" ]; then
+	if [ "$SY_REPO_LOC" == "remote" ] ; then
+	    RES=`ssh $SY_REMOTE_LOGIN "if [ -e $SY_REMOTE_PATH ] ; then echo TRUE ; else echo FALSE ; fi"`
+	else
+	    RES=`if [ -e $1 ] ; then echo TRUE ; else echo FALSE ; fi`
+	fi
+	if [ "$RES" == "FALSE" ]; then 
+	    echo "$1 doesn't exists"
+	    exit 1
+	else
+	    if [ "$SY_REPO_LOC" == "remote" ] ; then
+		RES=`ssh $SY_REMOTE_LOGIN "if [ -w $SY_REMOTE_PATH ] ; then echo TRUE ; else echo FALSE ; fi"`
+	    else
+		RES=`if [ -w $1 ] ; then echo TRUE ; else echo FALSE ; fi`
+	    fi
+	    if [ "$RES" == "FALSE" ]; then 
+		echo "$1 is not writeable"
+		exit 1
+	    fi
+	fi
+    else
+	echo "$1 needs to be a directory"
+	exit 1
+    fi
+}
+
+check_command()
+{
+    if [ "x$1" = "x" ]; then
+	echo "A command is needed."
+	usage
+    else
+	case "$1" in
+	    commit)
+		SY_MODE="$SY_MODE --itemize-changes --delete --force"
+		SY_COM="c"
+		;;
+	    update)
+		SY_MODE="$SY_MODE --itemize-changes --delete --force"
+		SY_COM="u"
+		;;
+	    *)
+		echo "Unkown command: $1"
+		usage 
+		;;
+	esac	
+    fi
+}
+
+versionInfo()
+{
+    echo "pSync is at version: $VERSION"
+}
+
+case "$1" in
+    --config)
+	if [ "$3" = "--show" ]; then
+	    SY_MODE="--dry-run"
+	    SY_SHOW="Yes"
+	    check_command $4
+	    do_sync $2
+	else
+	    check_command $3	
+	    do_sync $2
+	fi
+	;;
+    --show)
+	SY_MODE="--dry-run"
+	SY_SHOW="Yes"
+	if [ "$2" = "--config" ]; then 
+	    check_command $4	
+	    do_sync $3
+	else
+	    check_command $2
+	    do_sync
+	fi
+	;;
+    --help)
+	usage
+	;;
+    --version)
+	versionInfo
+	;;
+    *)
+	check_command $1
+	do_sync
+	;;
+esac
+
+exit $SY_SUCCESS_EXIT
+
